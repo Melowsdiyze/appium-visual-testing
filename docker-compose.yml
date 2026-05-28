@@ -1,0 +1,345 @@
+version: '3.8'
+
+services:
+  # ============================================
+  # INFRASTRUCTURE SERVICES
+  # ============================================
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: appium-postgres
+    environment:
+      POSTGRES_DB: appium_platform
+      POSTGRES_USER: appium_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - appium-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U appium_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: appium-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis123}
+    volumes:
+      - redis_data:/data
+    networks:
+      - appium-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:6
+    container_name: appium-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-mongo123}
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - appium-network
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: appium-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: appium
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-rabbit123}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "15672"
+    networks:
+      - appium-network
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: appium-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minio123456}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9001"
+    networks:
+      - appium-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    restart: unless-stopped
+
+  # ============================================
+  # BACKEND MICROSERVICES
+  # ============================================
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    container_name: appium-auth-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://appium_user:${POSTGRES_PASSWORD:-changeme123}@postgres/appium_platform
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379/0
+      SECRET_KEY: ${JWT_SECRET_KEY:-super-secret-jwt-key-change-in-production}
+      ALGORITHM: HS256
+    volumes:
+      - ./services/auth:/app
+      - ./shared:/app/shared
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  workspace-service:
+    build:
+      context: ./services/workspace
+      dockerfile: Dockerfile
+    container_name: appium-workspace-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://appium_user:${POSTGRES_PASSWORD:-changeme123}@postgres/appium_platform
+      STORAGE_PATH: /data/workspaces
+    volumes:
+      - ./services/workspace:/app
+      - workspace_storage:/data/workspaces
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  device-service:
+    build:
+      context: .
+      dockerfile: services/device/Dockerfile
+    container_name: appium-device-service
+    privileged: true
+    environment:
+      DATABASE_URL: postgresql+asyncpg://appium_user:${POSTGRES_PASSWORD:-changeme123}@postgres/appium_platform
+    volumes:
+      - ./services/device:/app
+      - ./shared:/app/shared
+      - /var/run/docker.sock:/var/run/docker.sock
+      - device_storage:/data/devices
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  recording-service:
+    build:
+      context: ./services/recording
+      dockerfile: Dockerfile
+    container_name: appium-recording-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://appium_user:${POSTGRES_PASSWORD:-changeme123}@postgres/appium_platform
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379/1
+    volumes:
+      - ./services/recording:/app
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+  codegen-service:
+    build:
+      context: .
+      dockerfile: services/codegen/Dockerfile
+    container_name: appium-codegen-service
+    privileged: true
+    environment:
+      DATABASE_URL: postgresql+asyncpg://appium_user:${POSTGRES_PASSWORD:-changeme123}@postgres/appium_platform
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minio123456}
+    volumes:
+      - ./services/codegen:/app
+      - ./shared:/app/shared
+      - ./templates:/app/templates
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      - postgres
+      - minio
+    restart: unless-stopped
+
+  executor-service:
+    build:
+      context: ./services/executor
+      dockerfile: Dockerfile
+    container_name: appium-executor-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://appium_user:${POSTGRES_PASSWORD:-changeme123}@postgres/appium_platform
+      MONGODB_URL: mongodb://admin:${MONGO_PASSWORD:-mongo123}@mongodb:27017
+      RABBITMQ_URL: amqp://appium:${RABBITMQ_PASSWORD:-rabbit123}@rabbitmq:5672
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: ${MINIO_PASSWORD:-minio123456}
+    volumes:
+      - ./services/executor:/app
+      - executor_temp:/tmp/executions
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      - postgres
+      - mongodb
+      - rabbitmq
+      - minio
+    restart: unless-stopped
+
+  scheduler-service:
+    build:
+      context: ./services/scheduler
+      dockerfile: Dockerfile
+    container_name: appium-scheduler-service
+    environment:
+      DATABASE_URL: postgresql+asyncpg://appium_user:${POSTGRES_PASSWORD:-changeme123}@postgres/appium_platform
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379/2
+      EXECUTOR_SERVICE_URL: http://executor-service:8000
+    volumes:
+      - ./services/scheduler:/app
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      - postgres
+      - redis
+      - executor-service
+    restart: unless-stopped
+
+  ai-service:
+    build:
+      context: ./services/ai_assistant
+      dockerfile: Dockerfile
+    container_name: appium-ai-service
+    environment:
+      OLLAMA_URL: http://YOUR_SERVER_IP:8888
+      OLLAMA_MODEL: playwright-melody:latest
+      DATABASE_URL: postgresql+asyncpg://appium_user:${POSTGRES_PASSWORD:-changeme123}@postgres/appium_platform
+      MONGODB_URL: mongodb://admin:${MONGO_PASSWORD:-mongo123}@mongodb:27017
+    volumes:
+      - ./services/ai_assistant:/app
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      - postgres
+      - mongodb
+    restart: unless-stopped
+
+  notification-service:
+    build:
+      context: ./services/notification
+      dockerfile: Dockerfile
+    container_name: appium-notification-service
+    environment:
+      RABBITMQ_URL: amqp://appium:${RABBITMQ_PASSWORD:-rabbit123}@rabbitmq:5672
+      TELEGRAM_ENABLED: "true"
+    volumes:
+      - ./services/notification:/app
+    ports:
+      - "8000"
+    networks:
+      - appium-network
+    depends_on:
+      - rabbitmq
+    restart: unless-stopped
+
+  # ============================================
+  # API GATEWAY
+  # ============================================
+
+  nginx:
+    image: nginx:alpine
+    container_name: appium-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/conf.d:/etc/nginx/conf.d
+    ports:
+      - "9678:80"
+    networks:
+      - appium-network
+    depends_on:
+      - auth-service
+      - workspace-service
+      - device-service
+      - recording-service
+      - codegen-service
+      - executor-service
+      - scheduler-service
+      - ai-service
+      - notification-service
+      - frontend
+    restart: unless-stopped
+
+  # ============================================
+  # FRONTEND
+  # ============================================
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: appium-frontend
+    environment:
+      VITE_API_URL: http://YOUR_SERVER_IP:9678
+      VITE_WS_URL: ws://YOUR_SERVER_IP:9678
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000"
+    networks:
+      - appium-network
+    restart: unless-stopped
+
+networks:
+  appium-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  mongodb_data:
+  rabbitmq_data:
+  minio_data:
+  workspace_storage:
+  device_storage:
+  executor_temp:

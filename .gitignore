@@ -1,0 +1,19 @@
+# Auto-generated
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+dist/
+build/
+*.log
+.DS_Store
+Thumbs.db
+data/
+__pycache__/
+*.pyc
+node_modules/
+*.log
+.env
+*.env
+!.env.example
+
